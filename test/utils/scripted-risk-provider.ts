@@ -1,4 +1,4 @@
-import { Queue } from 'bullmq';
+import { Queue, UnrecoverableError } from 'bullmq';
 import {
   RiskCheckRequest,
   RiskCheckResult,
@@ -14,14 +14,30 @@ import { SimulatedKybProvider } from '../../src/risk/providers/simulated-kyb.pro
  */
 export class ScriptedRiskProvider implements RiskProvider {
   calls = 0;
+  readonly idempotencyKeys: string[] = [];
   private failuresRemaining = 0;
   private delayMs = 0;
+  private permanentError = false;
+  private corruptResult = false;
   private readonly delegate = new SimulatedKybProvider();
 
   reset(): void {
     this.calls = 0;
+    this.idempotencyKeys.length = 0;
     this.failuresRemaining = 0;
     this.delayMs = 0;
+    this.permanentError = false;
+    this.corruptResult = false;
+  }
+
+  /** Like a 4xx from a vendor: retrying cannot help, so BullMQ must not retry. */
+  failPermanently(): void {
+    this.permanentError = true;
+  }
+
+  /** Returns a result the database rejects (score NaN), so the job fails *after* the provider call. */
+  returnCorruptResult(): void {
+    this.corruptResult = true;
   }
 
   failNext(times: number): void {
@@ -38,12 +54,15 @@ export class ScriptedRiskProvider implements RiskProvider {
 
   async assess(request: RiskCheckRequest): Promise<RiskCheckResult> {
     this.calls += 1;
+    this.idempotencyKeys.push(request.idempotencyKey);
     if (this.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    if (this.permanentError) throw new UnrecoverableError('Scripted permanent rejection');
     if (this.failuresRemaining > 0) {
       this.failuresRemaining -= 1;
       throw new RiskProviderUnavailableError('Scripted outage');
     }
-    return this.delegate.assess(request);
+    const result = await this.delegate.assess(request);
+    return this.corruptResult ? { ...result, score: Number.NaN } : result;
   }
 }
 

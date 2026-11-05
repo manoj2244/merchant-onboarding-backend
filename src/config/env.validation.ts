@@ -1,5 +1,5 @@
 import { plainToInstance } from 'class-transformer';
-import { IsEnum, IsInt, IsOptional, IsString, Max, Min, MinLength, validateSync } from 'class-validator';
+import { IsEnum, IsInt, IsOptional, IsString, Matches, Max, Min, MinLength, validateSync } from 'class-validator';
 
 export enum NodeEnv {
   Development = 'development',
@@ -48,7 +48,8 @@ export class EnvironmentVariables {
   @MinLength(32)
   JWT_SECRET: string;
 
-  @IsString()
+  // Unit is mandatory: a bare "3600" would be read as 3600 *milliseconds* by the jwt library.
+  @Matches(/^\d+[smhd]$/, { message: 'JWT_EXPIRES_IN must be a number with a unit, e.g. 15m, 1h, 1d' })
   JWT_EXPIRES_IN: string = '1h';
 
   @IsInt()

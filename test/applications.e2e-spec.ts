@@ -78,6 +78,7 @@ describe('Merchant applications (e2e)', () => {
       ['an unknown currency', { currency: 'XXQ' }],
       ['an unknown business type', { businessType: 'TRUST' }],
       ['a missing business name', { businessName: undefined }],
+      ['a NUL byte in a text field', { businessName: 'Evil\u0000Co' }],
     ])('rejects %s with 400', async (_label, overrides) => {
       await http().post('/applications').set(bearer(actors.salesA.token)).send(applicationPayload(overrides)).expect(400);
     });
@@ -101,6 +102,20 @@ describe('Merchant applications (e2e)', () => {
         before: { businessName: 'Example Coffee Roasters', ownerTaxId: '****1234' },
         after: { businessName: 'Renamed Roasters', ownerTaxId: '****9876' },
       });
+    });
+
+    it.each(['businessName', 'ownerTaxId', 'ownerEmail', 'requestedMonthlyVolume', 'businessType', 'mcc'])(
+      'rejects null for required field %s with 400 (not a 500 from the database)',
+      async (field) => {
+        const created = await createApplication(app, actors.salesA.token);
+        await http().patch(`/applications/${created.id}`).set(bearer(actors.salesA.token)).send({ [field]: null }).expect(400);
+      },
+    );
+
+    it('allows clearing the optional website with null', async () => {
+      const created = await createApplication(app, actors.salesA.token);
+      const res = await http().patch(`/applications/${created.id}`).set(bearer(actors.salesA.token)).send({ website: null }).expect(200);
+      expect(res.body.website).toBeNull();
     });
 
     it('does not write an audit entry when nothing changed', async () => {
@@ -161,8 +176,23 @@ describe('Merchant applications (e2e)', () => {
       expect(drafts.body.data.map((a: { id: string }) => a.id)).toEqual([draft.id]);
     });
 
-    it.each(['limit=0', 'limit=101', 'page=0', 'status=UNKNOWN', 'page=abc'])('rejects invalid query %s', async (qs) => {
+    it.each(['limit=0', 'limit=101', 'page=0', 'page=100001', 'page=1000000000000000000', 'status=UNKNOWN', 'page=abc'])('rejects invalid query %s', async (qs) => {
       await http().get(`/applications?${qs}`).set(bearer(actors.salesA.token)).expect(400);
+    });
+  });
+
+  describe('malformed requests never become a 500', () => {
+    it('answers 413 (not 500) for an oversized body', async () => {
+      const res = await http()
+        .post('/applications')
+        .set(bearer(actors.salesA.token))
+        .send(applicationPayload({ businessName: 'x'.repeat(200_000) }))
+        .expect(413);
+      expect(res.body).toMatchObject({ statusCode: 413, error: 'PAYLOAD_TOO_LARGE' });
+    });
+
+    it('answers 400 for malformed JSON', async () => {
+      await http().post('/applications').set(bearer(actors.salesA.token)).set('content-type', 'application/json').send('{"a":').expect(400);
     });
   });
 

@@ -6,6 +6,7 @@ import { SIMULATE_OUTAGE_MARKER, SimulatedKybProvider } from './simulated-kyb.pr
 describe('SimulatedKybProvider', () => {
   const provider = new SimulatedKybProvider();
   const request = (overrides: Partial<RiskCheckRequest> = {}): RiskCheckRequest => ({
+    idempotencyKey: '22222222-2222-4222-8222-222222222222',
     applicationId: '11111111-1111-4111-8111-111111111111',
     submissionNumber: 1,
     businessName: 'Example Coffee',

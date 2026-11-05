@@ -24,4 +24,8 @@ export class UsersService {
   findActiveReviewer(id: string): Promise<User | null> {
     return this.users.findOne({ where: { id, isActive: true, role: Role.REVIEWER } });
   }
+
+  listActiveReviewers(): Promise<User[]> {
+    return this.users.find({ where: { isActive: true, role: Role.REVIEWER }, order: { fullName: 'ASC', id: 'ASC' } });
+  }
 }

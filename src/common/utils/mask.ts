@@ -5,14 +5,22 @@
 
 const SECRET_KEYS = new Set(['password', 'passwordhash', 'token', 'accesstoken', 'refreshtoken', 'secret', 'authorization']);
 
-const lastFour = (value: string) => value.replace(/\s|-/g, '').slice(-4);
+/**
+ * Reveals the last 4 characters of normal-length values; short values (< 8 chars) reveal at most
+ * a third, so a short identifier is never effectively disclosed (e.g. "ABCD" → "****D").
+ */
+function revealTail(value: string): string {
+  const compact = value.replace(/\s|-/g, '');
+  const visible = compact.length >= 8 ? 4 : Math.floor(compact.length / 3);
+  return `****${visible > 0 ? compact.slice(-visible) : ''}`;
+}
 
 export function maskTaxId(value: string): string {
-  return `****${lastFour(value)}`;
+  return revealTail(value);
 }
 
 export function maskPhone(value: string): string {
-  return `****${lastFour(value)}`;
+  return revealTail(value);
 }
 
 export function maskEmail(value: string): string {

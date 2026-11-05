@@ -59,13 +59,15 @@ Submit commits the transition, the new `risk_assessments` row (PENDING) and the 
 | Layer | Mechanism |
 |---|---|
 | 1 | Deterministic job id `risk-<applicationId>-<submissionNumber>`, so duplicate adds are no-ops |
-| 2 | The worker re-checks the assessment under lock and skips terminal ones, so redelivery never calls the provider twice |
+| 2 | The worker re-checks the assessment under lock and skips terminal ones, so a duplicate job never re-runs a finished check and a result is written at most once |
 | 3 | The DB unique constraint |
 
 Retries:
 - Provider errors are re-thrown, so BullMQ retries 3 times with exponential backoff.
 - The final failure marks the assessment FAILED and is audited.
-- An ADMIN retry endpoint re-runs a FAILED or stuck PENDING check.
+- A `failed` worker-event handler marks the assessment FAILED however the job fails for good (including stalls and errors after the provider call), so nothing is left in PROCESSING.
+- An ADMIN retry endpoint re-runs a FAILED check, or one stuck in PENDING/PROCESSING when no job is in flight.
+- Delivery is at-least-once: a job redelivered after a worker crash calls the provider again, so the provider receives a stable idempotency key (the assessment id).
 
 The provider sits behind a DI token (`RISK_PROVIDER`). The bundled simulator is deterministic.
 

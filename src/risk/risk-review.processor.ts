@@ -1,7 +1,7 @@
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Inject, Logger } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
-import { Job } from 'bullmq';
+import { Job, UnrecoverableError } from 'bullmq';
 import { DataSource, EntityManager } from 'typeorm';
 import { ApplicationRiskStatus, ApplicationStatus } from '../applications/application.enums';
 import { ApplicationAction, transition } from '../applications/domain/application-state-machine';
@@ -23,12 +23,15 @@ interface LockedPair {
 
 /**
  * Consumes risk-review jobs. Guarantees:
- *  - Idempotent: a job for an assessment that is already CLEAR/FLAGGED/FAILED does nothing, so
- *    duplicate deliveries, duplicate enqueues or a retry after a crash cannot double-process.
+ *  - Idempotent outcome: a job for an assessment that is already CLEAR/FLAGGED/FAILED does nothing,
+ *    and the result is written at most once (re-checked under lock). Delivery is at-least-once: if a
+ *    worker dies mid-call, BullMQ redelivers and the provider is called again — so the provider
+ *    receives a stable idempotency key (the assessment id) to deduplicate on its side.
  *  - Never decides: on success the application moves SUBMITTED → UNDER_REVIEW (state machine
  *    rule COMPLETE_RISK_REVIEW). Approval is reserved for the assigned human reviewer.
- *  - Retries: provider errors are re-thrown so BullMQ retries with exponential backoff; the final
- *    failed attempt marks the assessment FAILED, which an admin can retry later.
+ *  - Retries: provider errors are re-thrown so BullMQ retries with exponential backoff. Whatever
+ *    makes the job fail for good (last attempt, UnrecoverableError, repeated stalls, a DB error)
+ *    ends in the 'failed' handler, which marks the assessment FAILED so an admin can retry it.
  *  - Lock order is always application → assessment (same as submit/retry), to avoid deadlocks.
  */
 @Processor(RISK_REVIEW_QUEUE, { concurrency: 5 })
@@ -59,6 +62,7 @@ export class RiskReviewProcessor extends WorkerHost {
     try {
       const app = claimed.application;
       result = await this.provider.assess({
+        idempotencyKey: claimed.assessment.id,
         applicationId: app.id,
         submissionNumber: claimed.assessment.submissionNumber,
         businessName: app.businessName,
@@ -71,7 +75,7 @@ export class RiskReviewProcessor extends WorkerHost {
         averageTicketSize: app.averageTicketSize,
       });
     } catch (err) {
-      const isFinalAttempt = attempt >= maxAttempts;
+      const isFinalAttempt = attempt >= maxAttempts || err instanceof UnrecoverableError;
       await this.recordFailure(assessmentId, err, isFinalAttempt);
       this.logger.warn({ ...logCtx, event: 'risk_job_attempt_failed', final: isFinalAttempt, error: errorMessage(err) });
       throw err; // let BullMQ apply retry/backoff (or move the job to failed)
@@ -89,6 +93,22 @@ export class RiskReviewProcessor extends WorkerHost {
   @OnWorkerEvent('error')
   onWorkerError(err: Error): void {
     this.logger.error({ event: 'risk_worker_error', error: errorMessage(err) });
+  }
+
+  /**
+   * Safety net for every way a job can fail for good, including paths where process() never ran
+   * or never reached its catch block (e.g. stalled twice → UnrecoverableError, or a DB error while
+   * saving the result). 'failed' also fires for attempts that will be retried, hence isFailed().
+   * recordFailure is a no-op when the assessment is already terminal.
+   */
+  @OnWorkerEvent('failed')
+  async onJobFailed(job: Job<RiskJobData> | undefined, err: Error): Promise<void> {
+    try {
+      if (!job || !(await job.isFailed())) return;
+      await this.recordFailure(job.data.assessmentId, err, true);
+    } catch (handlerErr) {
+      this.logger.error({ event: 'risk_failed_handler_error', jobId: job?.id, error: errorMessage(handlerErr) });
+    }
   }
 
   /** Claims the assessment for this attempt. Returns null if there is nothing (left) to do. */

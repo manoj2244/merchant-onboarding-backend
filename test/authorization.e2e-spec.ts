@@ -4,6 +4,7 @@ import { DataSource } from 'typeorm';
 import { ApplicationRiskStatus, ApplicationStatus } from '../src/applications/application.enums';
 import { MerchantApplication } from '../src/applications/entities/merchant-application.entity';
 import {
+  applicationPayload,
   bearer,
   createApplication,
   createStandardActors,
@@ -78,6 +79,17 @@ describe('Authorization (e2e)', () => {
       await http().get(`/applications/${appOfSalesA.id}/audit-logs`).set(bearer(actors.salesB.token)).expect(404);
     });
 
+    it("SALES cannot read another SALES user's decisions or risk assessments", async () => {
+      await http().get(`/applications/${appOfSalesA.id}/decisions`).set(bearer(actors.salesB.token)).expect(404);
+      await http().get(`/applications/${appOfSalesA.id}/risk-assessments`).set(bearer(actors.salesB.token)).expect(404);
+    });
+
+    it("SALES cannot submit another SALES user's application", async () => {
+      await http().post(`/applications/${appOfSalesA.id}/submit`).set(bearer(actors.salesB.token)).expect(404);
+      const stored = await dataSource.getRepository(MerchantApplication).findOneByOrFail({ id: appOfSalesA.id });
+      expect(stored.status).toBe(ApplicationStatus.DRAFT);
+    });
+
     it("SALES list never includes another SALES user's applications", async () => {
       await createApplication(app, actors.salesB.token, { businessName: 'Sales B Merchant' });
 
@@ -94,11 +106,13 @@ describe('Authorization (e2e)', () => {
         { assignedReviewerId: actors.reviewerA.user.id },
       ]) {
         await http().patch(`/applications/${appOfSalesA.id}`).set(bearer(actors.salesA.token)).send(field).expect(400);
-        await http()
+        // A complete, otherwise valid payload: the only reason to reject is the forbidden field.
+        const res = await http()
           .post('/applications')
           .set(bearer(actors.salesA.token))
-          .send({ ...field, businessName: 'x' })
+          .send(applicationPayload(field))
           .expect(400);
+        expect(res.body.message).toEqual([`property ${Object.keys(field)[0]} should not exist`]);
       }
       const stored = await dataSource.getRepository(MerchantApplication).findOneByOrFail({ id: appOfSalesA.id });
       expect(stored).toMatchObject({ createdById: actors.salesA.user.id, status: ApplicationStatus.DRAFT, assignedReviewerId: null });
@@ -232,6 +246,18 @@ describe('Authorization (e2e)', () => {
         .expect(403);
       const stored = await dataSource.getRepository(MerchantApplication).findOneByOrFail({ id: appOfSalesA.id });
       expect(stored.assignedReviewerId).toBeNull();
+    });
+  });
+
+  describe('GET /users/reviewers', () => {
+    it('ADMIN gets the active reviewers (no sensitive fields)', async () => {
+      const res = await http().get('/users/reviewers').set(bearer(actors.admin.token)).expect(200);
+      expect(res.body.map((r: { id: string }) => r.id).sort()).toEqual([actors.reviewerA.user.id, actors.reviewerB.user.id].sort());
+      expect(Object.keys(res.body[0]).sort()).toEqual(['email', 'fullName', 'id']);
+    });
+
+    it.each(['salesA', 'reviewerA'] as const)('%s cannot list users', async (who) => {
+      await http().get('/users/reviewers').set(bearer(actors[who].token)).expect(403);
     });
   });
 

@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { AuthenticatedUser } from '../auth/authenticated-user';
@@ -17,7 +17,13 @@ import { CreateDecisionDto, DecisionResponseDto, DecisionResultDto } from './dto
 import { ReviewDecision } from './entities/review-decision.entity';
 import { ApplicationAccessPolicy } from './policies/application-access.policy';
 
-const DECISION_RULES: Record<DecisionType, { action: ApplicationAction; audit: AuditAction }> = {
+const RETRYABLE_RISK_STATUSES: readonly RiskAssessmentStatus[] = [
+  RiskAssessmentStatus.FAILED,
+  RiskAssessmentStatus.PENDING,
+  RiskAssessmentStatus.PROCESSING,
+];
+
+const DECISION_RULES:Record<DecisionType, { action: ApplicationAction; audit: AuditAction }> = {
   [DecisionType.APPROVE]: { action: ApplicationAction.APPROVE, audit: AuditAction.APPLICATION_APPROVED },
   [DecisionType.REJECT]: { action: ApplicationAction.REJECT, audit: AuditAction.APPLICATION_REJECTED },
   [DecisionType.REQUEST_INFO]: { action: ApplicationAction.REQUEST_INFO, audit: AuditAction.INFORMATION_REQUESTED },
@@ -178,8 +184,12 @@ export class ApplicationWorkflowService {
         .setLock('pessimistic_write')
         .where('ra.applicationId = :id AND ra.submissionNumber = :n', { id, n: application.submissionCount })
         .getOne();
-      if (!assessment || ![RiskAssessmentStatus.FAILED, RiskAssessmentStatus.PENDING].includes(assessment.status)) {
-        throw new ConflictException('Only a FAILED or PENDING risk assessment can be retried');
+      if (!assessment || !RETRYABLE_RISK_STATUSES.includes(assessment.status)) {
+        throw new ConflictException('Only a FAILED or stuck PENDING/PROCESSING risk assessment can be retried');
+      }
+      // PENDING/PROCESSING is only "stuck" if no job is waiting, running or scheduled for a retry.
+      if (assessment.status !== RiskAssessmentStatus.FAILED && (await this.isJobInFlight(assessment))) {
+        throw new ConflictException('The risk check is still in progress');
       }
 
       const previousStatus = assessment.status;
@@ -199,18 +209,27 @@ export class ApplicationWorkflowService {
       return assessment;
     });
 
-    await this.riskQueue.enqueue(assessment, { replaceFinishedJob: true });
+    await this.enqueueAfterCommit(assessment, { replaceFinishedJob: true });
     return RiskAssessmentResponseDto.from(assessment);
   }
 
-  /**
-   * If Redis is down at this moment the submission itself has still succeeded (it is committed);
-   * the assessment stays PENDING and an admin can re-enqueue it via the retry endpoint.
-   * A transactional outbox would remove this gap entirely (see README trade-offs).
-   */
-  private async enqueueAfterCommit(ref: AssessmentRef): Promise<void> {
+  private async isJobInFlight(ref: AssessmentRef): Promise<boolean> {
     try {
-      await this.riskQueue.enqueue(ref);
+      return await this.riskQueue.isInFlight(ref);
+    } catch {
+      throw new ServiceUnavailableException('Risk queue is unavailable; try again later');
+    }
+  }
+
+  /**
+   * If Redis is down at this moment the change itself has still succeeded (it is committed) and the
+   * enqueue times out quickly instead of hanging the request; the assessment stays PENDING and an
+   * admin can re-enqueue it via the retry endpoint. A transactional outbox would remove this gap
+   * entirely (see README trade-offs).
+   */
+  private async enqueueAfterCommit(ref: AssessmentRef, opts: { replaceFinishedJob?: boolean } = {}): Promise<void> {
+    try {
+      await this.riskQueue.enqueue(ref, opts);
     } catch (err) {
       this.logger.error({
         event: 'risk_job_enqueue_failed',

@@ -37,13 +37,25 @@ export class RiskReviewProducer {
    */
   async enqueue(ref: AssessmentRef, opts: { replaceFinishedJob?: boolean } = {}): Promise<void> {
     const jobId = riskJobId(ref);
-    if (opts.replaceFinishedJob) {
+    await withTimeout(this.addJob(ref, jobId, opts.replaceFinishedJob ?? false), ENQUEUE_TIMEOUT_MS, 'Enqueue timed out (Redis unavailable?)');
+    this.logger.log({ event: 'risk_job_enqueued', jobId, assessmentId: ref.id });
+  }
+
+  /** True while the submission's job is waiting, running, or scheduled for a retry. */
+  async isInFlight(ref: Pick<AssessmentRef, 'applicationId' | 'submissionNumber'>): Promise<boolean> {
+    const job = await this.queue.getJob(riskJobId(ref));
+    if (!job) return false;
+    return IN_FLIGHT_STATES.has(await job.getState());
+  }
+
+  private async addJob(ref: AssessmentRef, jobId: string, replaceFinishedJob: boolean): Promise<void> {
+    if (replaceFinishedJob) {
       const existing = await this.queue.getJob(jobId);
       if (existing && ((await existing.isFailed()) || (await existing.isCompleted()))) {
-        await existing.remove();
+        // A concurrent retry may have removed it already; the add below is deduplicated anyway.
+        await existing.remove().catch(() => undefined);
       }
     }
-
     await this.queue.add(
       RISK_ASSESS_JOB,
       { assessmentId: ref.id },
@@ -55,6 +67,18 @@ export class RiskReviewProducer {
         removeOnFail: { age: 7 * 24 * 3600 },
       },
     );
-    this.logger.log({ event: 'risk_job_enqueued', jobId, assessmentId: ref.id });
   }
+}
+
+/** ioredis would otherwise keep retrying for a long time and hang the HTTP request. */
+const ENQUEUE_TIMEOUT_MS = 5_000;
+const IN_FLIGHT_STATES = new Set(['waiting', 'active', 'delayed', 'prioritized', 'waiting-children']);
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  promise.catch(() => undefined); // a late rejection after the timeout must not go unhandled
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }

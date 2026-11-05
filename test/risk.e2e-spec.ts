@@ -184,6 +184,41 @@ describe('Asynchronous risk review (e2e)', () => {
     });
   });
 
+  describe('permanent failures', () => {
+    it('does not retry an unrecoverable provider error and marks the check FAILED', async () => {
+      provider.failPermanently();
+      const created = await createApplication(app, actors.salesA.token);
+      await submit(created.id).expect(202);
+
+      const assessment = await waitForAssessment(created.id, [RiskAssessmentStatus.FAILED]);
+      expect(provider.calls).toBe(1);
+      expect(assessment.lastError).toContain('Scripted permanent rejection');
+      expect((await applicationRow(created.id)).riskStatus).toBe(ApplicationRiskStatus.FAILED);
+    });
+
+    it('a failure after the provider call (e.g. DB error saving the result) still ends FAILED, never stuck in PROCESSING', async () => {
+      provider.returnCorruptResult();
+      const created = await createApplication(app, actors.salesA.token);
+      await submit(created.id).expect(202);
+
+      const assessment = await waitForAssessment(created.id, [RiskAssessmentStatus.FAILED]);
+      expect(provider.calls).toBe(3); // retried, then failed for good via the worker 'failed' handler
+      expect(assessment.lastError).toBeTruthy();
+      const application = await applicationRow(created.id);
+      expect(application.status).toBe(ApplicationStatus.SUBMITTED);
+      expect(application.riskStatus).toBe(ApplicationRiskStatus.FAILED);
+      expect((await auditActions(created.id)).filter((a) => a === AuditAction.RISK_ASSESSMENT_FAILED)).toHaveLength(1);
+    });
+
+    it('sends the provider a stable idempotency key across retries (the assessment id)', async () => {
+      provider.failNext(2);
+      const created = await createApplication(app, actors.salesA.token);
+      await submit(created.id).expect(202);
+      const assessment = await waitForAssessment(created.id, [RiskAssessmentStatus.CLEAR]);
+      expect(provider.idempotencyKeys).toEqual([assessment.id, assessment.id, assessment.id]);
+    });
+  });
+
   describe('idempotency', () => {
     it('a duplicate job for a finished assessment is skipped and never reaches the provider', async () => {
       const created = await createApplication(app, actors.salesA.token);
@@ -271,6 +306,27 @@ describe('Asynchronous risk review (e2e)', () => {
 
     it('SALES cannot trigger a retry', async () => {
       await http().post(`/applications/${applicationId}/risk-assessments/retry`).set(bearer(actors.salesA.token)).expect(403);
+    });
+
+    it.each([RiskAssessmentStatus.PENDING, RiskAssessmentStatus.PROCESSING])(
+      'recovers a check stuck in %s with no job in flight (lost enqueue / crashed worker)',
+      async (stuckStatus) => {
+        await queue.obliterate({ force: true }); // no job exists for it any more
+        await dataSource.getRepository(RiskAssessment).update({ applicationId }, { status: stuckStatus, completedAt: null });
+
+        await http().post(`/applications/${applicationId}/risk-assessments/retry`).set(bearer(actors.admin.token)).expect(202);
+        await waitForAssessment(applicationId, [RiskAssessmentStatus.CLEAR]);
+        expect((await applicationRow(applicationId)).status).toBe(ApplicationStatus.UNDER_REVIEW);
+      },
+    );
+
+    it('refuses to retry while the check is genuinely in progress', async () => {
+      provider.respondAfter(1_500);
+      await http().post(`/applications/${applicationId}/risk-assessments/retry`).set(bearer(actors.admin.token)).expect(202);
+      const res = await http().post(`/applications/${applicationId}/risk-assessments/retry`).set(bearer(actors.admin.token)).expect(409);
+      expect(res.body.message).toBe('The risk check is still in progress');
+      await waitForAssessment(applicationId, [RiskAssessmentStatus.CLEAR]);
+      expect(provider.calls).toBe(1);
     });
 
     it('returns 409 when there is nothing to retry', async () => {

@@ -14,6 +14,7 @@ import {
   MaxLength,
   Min,
 } from 'class-validator';
+import { NoNullBytes } from '../../common/validation/no-null-bytes';
 import { BusinessType } from '../application.enums';
 
 const trim = ({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value);
@@ -23,6 +24,7 @@ export class CreateApplicationDto {
   @Transform(trim)
   @IsString()
   @IsNotEmpty()
+  @NoNullBytes()
   @MaxLength(200)
   businessName: string;
 
@@ -30,6 +32,7 @@ export class CreateApplicationDto {
   @Transform(trim)
   @IsString()
   @IsNotEmpty()
+  @NoNullBytes()
   @MaxLength(200)
   legalBusinessName: string;
 
@@ -47,6 +50,7 @@ export class CreateApplicationDto {
   @Transform(trim)
   @IsString()
   @IsNotEmpty()
+  @NoNullBytes()
   @MaxLength(200)
   ownerFullName: string;
 

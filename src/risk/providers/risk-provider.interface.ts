@@ -9,6 +9,8 @@ export const RISK_PROVIDER = Symbol('RISK_PROVIDER');
  * is not needed by the simulated provider, so it is not sent.
  */
 export interface RiskCheckRequest {
+  /** Stable per assessment; lets a real vendor deduplicate at-least-once redeliveries. */
+  idempotencyKey: string;
   applicationId: string;
   submissionNumber: number;
   businessName: string;

@@ -40,8 +40,9 @@ describe('Authentication (e2e)', () => {
       expect(JSON.stringify(res.body)).not.toMatch(/password/i);
     });
 
-    it('treats the email case-insensitively', async () => {
+    it('treats the email case-insensitively and ignores surrounding spaces', async () => {
       await http().post('/auth/login').send({ email: 'SALES@Example.com', password: TEST_PASSWORD }).expect(200);
+      await http().post('/auth/login').send({ email: '  sales@example.com ', password: TEST_PASSWORD }).expect(200);
     });
 
     it('rejects a wrong password with a generic 401', async () => {

@@ -9,10 +9,12 @@ export class ListApplicationsQueryDto {
   @IsEnum(ApplicationStatus)
   status?: ApplicationStatus;
 
-  @ApiPropertyOptional({ default: 1, minimum: 1 })
+  // Capped so OFFSET stays far inside PostgreSQL's bigint range (huge values would be a 500).
+  @ApiPropertyOptional({ default: 1, minimum: 1, maximum: 100_000 })
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(100_000)
   page: number = 1;
 
   @ApiPropertyOptional({ default: 20, minimum: 1, maximum: 100 })

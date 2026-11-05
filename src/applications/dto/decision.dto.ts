@@ -1,6 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { IsEnum, IsNotEmpty, IsString, MaxLength, ValidateIf } from 'class-validator';
+import { NoNullBytes } from '../../common/validation/no-null-bytes';
 import { ApplicationStatus, DecisionType } from '../application.enums';
 import { ReviewDecision } from '../entities/review-decision.entity';
 
@@ -17,6 +18,7 @@ export class CreateDecisionDto {
   @ValidateIf((dto: CreateDecisionDto) => dto.decision !== DecisionType.APPROVE || dto.comment !== undefined)
   @IsString()
   @IsNotEmpty({ message: 'comment is required when rejecting or requesting information' })
+  @NoNullBytes()
   @MaxLength(2000)
   comment?: string;
 }

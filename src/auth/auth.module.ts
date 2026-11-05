@@ -24,7 +24,7 @@ type Config = ConfigService<EnvironmentVariables, true>;
         secret: config.get('JWT_SECRET'),
         signOptions: {
           algorithm: 'HS256',
-          expiresIn: config.get('JWT_EXPIRES_IN') as `${number}${'s' | 'm' | 'h' | 'd'}`,
+          expiresIn: config.get('JWT_EXPIRES_IN') as `${number}${'s' | 'm' | 'h' | 'd'}`, // format enforced by env validation
         },
       }),
     }),

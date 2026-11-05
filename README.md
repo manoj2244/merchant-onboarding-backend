@@ -170,6 +170,7 @@ flowchart LR
 | Assign reviewer | ❌ 403 | ❌ 403 | ✅ |
 | Approve / reject / request info | ❌ 403 | **assigned reviewer only** | ❌ 403 |
 | Retry a failed risk check | ❌ 403 | ❌ 403 | ✅ |
+| List reviewers (`GET /users/reviewers`) | ❌ 403 | ❌ 403 | ✅ |
 | View risk assessments, decisions, audit trail | own only | assigned only | all |
 
 **How it's enforced: three independent layers**
@@ -178,7 +179,7 @@ flowchart LR
 2. **Visibility scope, inside the SQL query:** `ApplicationAccessPolicy.applyVisibilityScope` adds `created_by_id = :me` (SALES) or `assigned_reviewer_id = :me` (REVIEWER). Every read and write loads the application through this scope, so an out-of-scope application is never loaded and the API answers **404, identical to a non-existent id**. IDs cannot be probed.
 3. **Action rules:** `assertCanModify`, `assertCanDecide` and `assertCanAssign` re-check ownership and assignment on the loaded row (403).
 
-Each layer is sufficient on its own. During development each one was disabled in turn to confirm the remaining layers and the tests still catch the bypass. ADMIN deliberately **cannot** record decisions: the brief says only the assigned reviewer may.
+For **state-changing** actions (edit, submit, decide, assign) at least two layers apply, so removing any single check does not open a bypass. During development the role guard and the decision policy were each disabled in turn to confirm this. **Read** endpoints (`GET :id`, decisions, risk assessments, audit logs) rely on the visibility scope, which is enforced by the shared loader every route uses and covered by the cross-user e2e tests. ADMIN deliberately **cannot** record decisions: the brief says only the assigned reviewer may.
 
 ---
 
@@ -200,7 +201,8 @@ Full interactive documentation is at `/docs` (Swagger). All routes except login 
 | POST | `/applications/:id/decisions` | `{ decision, comment? }` | 201 |
 | GET | `/applications/:id/decisions` | Decision history | 200 |
 | GET | `/applications/:id/risk-assessments` | One per submission, newest first | 200 |
-| POST | `/applications/:id/risk-assessments/retry` | Re-run a FAILED or stuck check | **202** |
+| POST | `/applications/:id/risk-assessments/retry` | Re-run a FAILED check, or one stuck in PENDING/PROCESSING with no job in flight (ADMIN) | **202** |
+| GET | `/users/reviewers` | Active reviewers, used to pick a `reviewerId` (ADMIN) | 200 |
 | GET | `/applications/:id/audit-logs` | Audit trail (masked) | 200 |
 
 **Error format** (every error, via `AllExceptionsFilter`):
@@ -215,7 +217,8 @@ Full interactive documentation is at `/docs` (Swagger). All routes except login 
 | 401 | Missing, invalid or expired token, or deactivated user |
 | 403 | Role or action not allowed on an application you can see |
 | 404 | Does not exist **or** is outside your visibility |
-| 409 | Invalid state transition |
+| 409 | Invalid state transition, or a risk check that is still in progress |
+| 413 | Request body too large |
 | 429 | Login rate limit |
 
 ---
@@ -256,20 +259,24 @@ All rules are in one pure table: [`application-state-machine.ts`](src/applicatio
 **Producer** ([`risk-review.producer.ts`](src/risk/risk-review.producer.ts))
 - Submit commits the state change and the new `risk_assessments` row first, and **enqueues only after the commit**, so the worker can never see a job whose row doesn't exist, and a rolled-back submit never leaves a ghost job.
 - Job options: `attempts: 3`, exponential backoff (`RISK_JOB_BACKOFF_MS`, default 2 s), and a deterministic job id `risk-<applicationId>-<submissionNumber>`.
+- The enqueue has a 5 s timeout, so a Redis outage cannot hang the HTTP request; the submission stays saved (PENDING) and can be re-enqueued by an ADMIN.
 
 **Worker** ([`risk-review.processor.ts`](src/risk/risk-review.processor.ts)), concurrency 5:
 1. Lock the application, then the assessment (the same order everywhere, which avoids deadlocks). If the assessment is already terminal, return `skipped`.
 2. Mark it `PROCESSING` and increment `attempts`.
-3. Call the `RiskProvider`. Only business data is sent; owner PII is not.
+3. Call the `RiskProvider` with a stable **idempotency key** (the assessment id). Only business data is sent; owner PII is not.
 4. **On success**, in one transaction: store the score, level, reason codes and provider reference, move the application `SUBMITTED → UNDER_REVIEW`, set `riskStatus` CLEAR or FLAGGED, and audit `RISK_ASSESSMENT_COMPLETED` (actor = system). A result for an *older* submission is stored but doesn't move the application.
-5. **On error:** record `lastError` and re-throw so BullMQ retries with backoff. On the **final** attempt the assessment becomes `FAILED` (the application stays SUBMITTED with `riskStatus` FAILED) and `RISK_ASSESSMENT_FAILED` is audited. An ADMIN can then `POST …/risk-assessments/retry`.
+5. **On error:** record `lastError` and re-throw so BullMQ retries with backoff. An `UnrecoverableError` (e.g. a vendor 4xx) is not retried. When the job fails for good, the assessment becomes `FAILED` (the application stays SUBMITTED with `riskStatus` FAILED) and `RISK_ASSESSMENT_FAILED` is audited. An ADMIN can then `POST …/risk-assessments/retry`.
+6. **Safety net:** a `failed` worker-event handler covers every way a job can fail for good, including paths where `process()` never reached its catch block (a job that stalled twice, or a DB error while saving the result). Without it the assessment could be left in `PROCESSING` forever; a test reproduces exactly that scenario.
+
+Delivery is **at-least-once**: if a worker dies mid-call, BullMQ redelivers the job and the provider is called again. The outcome is still written exactly once, and a real vendor can deduplicate on the idempotency key.
 
 **Idempotency: three layers, each tested**
 
 | Layer | Protects against |
 |---|---|
 | Deterministic BullMQ `jobId` | The same submission being enqueued twice. The second `add` is a no-op. |
-| Worker skips terminal assessments (checked again under lock) | Redelivery, a duplicate job with another id, or a retry after a crash. The provider is not called again. |
+| Worker skips terminal assessments (checked again under lock before writing) | A duplicate job or redelivery after the check finished: the provider is not called again and the result is never written twice. |
 | `UNIQUE (application_id, submission_number)` in PostgreSQL | Any code path creating a second assessment for the same submission |
 
 **Provider abstraction:** the worker depends on the `RISK_PROVIDER` token. A real vendor client is a new class bound to that token. The simulator is deterministic, so tests are repeatable and never call a real third party.
@@ -296,7 +303,7 @@ erDiagram
 | `review_decisions` | Permanent decision history (a request-info loop produces several) |
 | `audit_logs` | Append-only: a **trigger rejects UPDATE/DELETE**; index `(entity_type, entity_id, created_at)` |
 
-**Migrations:** [`src/database/migrations`](src/database/migrations). The migration is hand-written, with named constraints (`pk_`, `fk_`, `uq_`, `chk_`, `idx_`), `ON DELETE RESTRICT` everywhere, and PostgreSQL enums. `synchronize` is off in every environment. `npm run typeorm -- schema:log` confirms the entities and the migration match exactly. `down()` is tested (revert, then re-run).
+**Migrations:** [`src/database/migrations`](src/database/migrations). The migration is hand-written, with named constraints (`pk_`, `fk_`, `uq_`, `chk_`, `idx_`), `ON DELETE RESTRICT` everywhere, and PostgreSQL enums. `synchronize` is off in every environment. `npm run typeorm -- schema:log` confirms the entities and the migration match exactly. `down()` was verified manually (revert, then re-run).
 
 ---
 
@@ -316,10 +323,10 @@ erDiagram
 - The seed refuses to run in production.
 
 **Logs**
-- `LoggingInterceptor` logs method, route, status, duration and user id only. **Bodies and headers are never logged.**
+- `LoggingInterceptor` (successes) and `AllExceptionsFilter` (errors, including 401/403 rejected by guards) log method, route, status and user id only. **Bodies and headers are never logged.**
 - pino `redact` additionally censors `authorization`, `cookie`, `password`, `token` and owner PII paths.
 - Login logs the user id and outcome, never the submitted email or password.
-- Unknown errors return a generic 500 with no stack trace or SQL.
+- Unknown errors return a generic 500 with no stack trace or SQL. Malformed input never reaches the database as a 500: NUL bytes, `null` for required fields, oversized page numbers and oversized bodies are all rejected with a 4xx.
 
 **Masking:** [`mask.ts`](src/common/utils/mask.ts) is applied centrally in `AuditService.record`:
 - tax id becomes `****1234` and phone `****1234`
@@ -349,8 +356,8 @@ Recommended approach: envelope encryption (AES-256-GCM data keys wrapped by a KM
 
 ```bash
 docker compose up -d
-npm run test       # 78 unit tests, 5 suites
-npm run test:e2e   # 103 API tests, 5 suites (real PostgreSQL + Redis + BullMQ worker)
+npm run test       # 79 unit tests, 5 suites
+npm run test:e2e   # 126 API tests, 5 suites (real PostgreSQL + Redis + BullMQ worker)
 ```
 
 **Isolation:** e2e tests use a separate database (`merchant_test`, created by `docker/postgres/init.sql`) and Redis DB 1. Global setup runs the real migrations, and each test truncates tables and clears the queue. Development data is never touched. The KYB provider is replaced by a scriptable double (fail N times, fail always, respond slowly) through Nest's `overrideProvider`.
@@ -361,9 +368,9 @@ npm run test:e2e   # 103 API tests, 5 suites (real PostgreSQL + Redis + BullMQ w
 | Unit: access policy | Every role × action, including fail-closed for an unknown role |
 | Unit: masking, roles guard, simulated provider | Redaction at any depth, determinism, scoring rules |
 | `auth.e2e` | Login success/failure, no enumeration, validation, missing/malformed/forged/`alg:none`/expired tokens, deactivated user, role from DB |
-| `authorization.e2e` | **SALES cannot read, update, submit or see the audit trail or risk data of another SALES user's application by id (404, same as non-existent)**; mass-assignment of `status`/`createdById`/`assignedReviewerId` rejected; reviewer scope; SALES/ADMIN/unassigned reviewer cannot decide; reassignment revokes access; only ADMIN assigns |
-| `applications.e2e` | Create/update validation, editable-state rules (409), pagination and filtering, masked audit metadata, append-only audit enforced by the DB |
-| `risk.e2e` | 202 without waiting; job id and options; worker success/FLAGGED; **never auto-approves**; retries with backoff; final failure → FAILED; duplicate job skipped (provider not called again); duplicate enqueue → one job; DB unique constraint; concurrent submits; resubmission → assessment #2; admin retry |
+| `authorization.e2e` | **SALES cannot read, update, submit, or see the audit trail, decisions or risk assessments of another SALES user's application by id (404, same as non-existent)**; mass-assignment of `status`/`createdById`/`riskStatus`/`assignedReviewerId` rejected on a fully valid payload; reviewer scope; SALES/ADMIN/unassigned reviewer cannot decide; reassignment revokes access; only ADMIN assigns or lists reviewers |
+| `applications.e2e` | Create/update validation (incl. `null` for required fields, NUL bytes), editable-state rules (409), pagination and filtering, oversized body → 413, masked audit metadata, append-only audit enforced by the DB |
+| `risk.e2e` | 202 without waiting; job id and options; worker success/FLAGGED; **never auto-approves**; retries with backoff; final failure → FAILED; unrecoverable error not retried; failure *after* the provider call still ends FAILED (never stuck); stable idempotency key; duplicate job skipped; duplicate enqueue → one job; DB unique constraint; concurrent submits; resubmission → assessment #2; admin retry, including stuck PENDING/PROCESSING, and refusal while in progress |
 | `lifecycle.e2e` | Full flows through the public API only: approve, reject a FLAGGED one, request-info loop, every invalid transition, assignment and decision validation |
 
 ---
@@ -372,7 +379,9 @@ npm run test:e2e   # 103 API tests, 5 suites (real PostgreSQL + Redis + BullMQ w
 
 | Decision / limitation | Reasoning and production follow-up |
 |---|---|
-| **Enqueue after commit** instead of a transactional outbox | Simple and correct for the common case. If Redis is unavailable at that exact moment the submission is saved but the assessment stays PENDING; the error is logged and an ADMIN can re-enqueue it via the retry endpoint. Production: an outbox table plus a relay, or a periodic sweeper for stale PENDING rows. |
+| **Enqueue after commit** instead of a transactional outbox | Simple and correct for the common case. If Redis is unavailable at that exact moment the submission is saved but the assessment stays PENDING; the enqueue times out after 5 s, the error is logged, and an ADMIN can re-enqueue it via the retry endpoint. Production: an outbox table plus a relay, or a periodic sweeper for stale PENDING rows. |
+| At-least-once delivery | A redelivered job (worker crash mid-call) calls the provider again; results are written once and the provider gets an idempotency key. |
+| E2E retry tests use a 50 ms backoff | Keeps the suite fast; tests poll for the outcome instead of sleeping. |
 | Worker runs **in the API process** | Simplest to run locally. Production: same image, separate entrypoint/deployment so API and workers scale independently. |
 | Pessimistic row locks | Correctness over throughput; contention is per application only. |
 | 404 (not 403) for out-of-scope applications | Prevents id enumeration; clients cannot distinguish "missing" from "not yours". |

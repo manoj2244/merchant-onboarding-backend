@@ -3,9 +3,10 @@ import { Request, Response } from 'express';
 import { Observable, tap } from 'rxjs';
 
 /**
- * Logs one line per request: method, route pattern, status, duration and the caller's user id.
- * Bodies, query strings and headers are deliberately not logged, so passwords, tokens and
- * merchant PII cannot reach the logs through this path.
+ * Logs one line per successful request: method, route pattern, status, duration and the caller's
+ * user id. Error responses are logged by AllExceptionsFilter (which also sees requests rejected by
+ * guards, before any interceptor runs). Bodies, query strings and headers are deliberately not
+ * logged, so passwords, tokens and merchant PII cannot reach the logs through this path.
  */
 @Injectable()
 export class LoggingInterceptor implements NestInterceptor {
@@ -19,20 +20,16 @@ export class LoggingInterceptor implements NestInterceptor {
     const started = Date.now();
     const route = (req.route as { path?: string } | undefined)?.path ?? req.path;
 
-    const log = (statusCode: number) =>
-      this.logger.log({
-        method: req.method,
-        route,
-        statusCode,
-        durationMs: Date.now() - started,
-        userId: req.user?.id,
-      });
-
     return next.handle().pipe(
-      tap({
-        next: () => log(http.getResponse<Response>().statusCode),
-        error: (err: { getStatus?: () => number }) => log(err.getStatus?.() ?? 500),
-      }),
+      tap(() =>
+        this.logger.log({
+          method: req.method,
+          route,
+          statusCode: http.getResponse<Response>().statusCode,
+          durationMs: Date.now() - started,
+          userId: req.user?.id,
+        }),
+      ),
     );
   }
 }

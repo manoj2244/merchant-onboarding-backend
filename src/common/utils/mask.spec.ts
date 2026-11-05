@@ -5,6 +5,15 @@ describe('masking', () => {
     expect(maskTaxId('TEST-000-1234')).toBe('****1234');
   });
 
+  it('never reveals more than a third of a short identifier', () => {
+    expect(maskTaxId('AB')).toBe('****');
+    expect(maskTaxId('ABCD')).toBe('****D');
+    expect(maskTaxId('AB-CD')).toBe('****D');
+    expect(maskTaxId('ABCDEF')).toBe('****EF');
+    expect(maskTaxId('ABCDEFG')).toBe('****FG');
+    expect(maskTaxId('A1B2C3D4E5')).toBe('****D4E5');
+  });
+
   it('keeps only the last 4 digits of a phone number', () => {
     expect(maskPhone('+15550101234')).toBe('****1234');
   });
