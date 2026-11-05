@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { AuthenticatedUser } from '../auth/authenticated-user';
@@ -8,13 +8,26 @@ import { RiskAssessmentResponseDto } from '../risk/dto/risk-assessment-response.
 import { RiskAssessment } from '../risk/entities/risk-assessment.entity';
 import { AssessmentRef, RiskReviewProducer } from '../risk/risk-review.producer';
 import { RiskAssessmentStatus } from '../risk/risk.enums';
-import { ApplicationRiskStatus, ApplicationStatus } from './application.enums';
+import { UsersService } from '../users/users.service';
+import { ApplicationRiskStatus, ApplicationStatus, DecisionType } from './application.enums';
 import { ApplicationsService } from './applications.service';
 import { ApplicationAction, transition } from './domain/application-state-machine';
 import { ApplicationResponseDto } from './dto/application-response.dto';
+import { CreateDecisionDto, DecisionResponseDto, DecisionResultDto } from './dto/decision.dto';
+import { ReviewDecision } from './entities/review-decision.entity';
 import { ApplicationAccessPolicy } from './policies/application-access.policy';
 
-/** State-changing workflow operations on an application (submit, risk retry; review in step 6). */
+const DECISION_RULES: Record<DecisionType, { action: ApplicationAction; audit: AuditAction }> = {
+  [DecisionType.APPROVE]: { action: ApplicationAction.APPROVE, audit: AuditAction.APPLICATION_APPROVED },
+  [DecisionType.REJECT]: { action: ApplicationAction.REJECT, audit: AuditAction.APPLICATION_REJECTED },
+  [DecisionType.REQUEST_INFO]: { action: ApplicationAction.REQUEST_INFO, audit: AuditAction.INFORMATION_REQUESTED },
+};
+
+/**
+ * State-changing workflow operations: submit, risk retry, reviewer assignment and decisions.
+ * Each one is a single transaction holding a row lock on the application, so the state check,
+ * the change and its audit entry cannot interleave with another request.
+ */
 @Injectable()
 export class ApplicationWorkflowService {
   private readonly logger = new Logger(ApplicationWorkflowService.name);
@@ -22,10 +35,83 @@ export class ApplicationWorkflowService {
   constructor(
     @InjectDataSource() private readonly dataSource: DataSource,
     private readonly applications: ApplicationsService,
+    private readonly users: UsersService,
     private readonly policy: ApplicationAccessPolicy,
     private readonly audit: AuditService,
     private readonly riskQueue: RiskReviewProducer,
   ) {}
+
+  async assignReviewer(user: AuthenticatedUser, id: string, reviewerId: string): Promise<ApplicationResponseDto> {
+    this.policy.assertCanAssign(user);
+    const reviewer = await this.users.findActiveReviewer(reviewerId);
+    if (!reviewer) throw new BadRequestException('reviewerId must reference an active REVIEWER');
+
+    const application = await this.dataSource.transaction(async (manager) => {
+      const application = await this.applications.loadVisible(user, id, { manager, lock: true });
+      transition(application.status, ApplicationAction.ASSIGN_REVIEWER);
+      if (application.assignedReviewerId === reviewer.id) return application; // idempotent
+
+      const previousReviewerId = application.assignedReviewerId;
+      application.assignedReviewerId = reviewer.id;
+      await manager.save(application);
+
+      await this.audit.record(manager, {
+        actorId: user.id,
+        action: AuditAction.REVIEWER_ASSIGNED,
+        entityType: AuditEntityType.MERCHANT_APPLICATION,
+        entityId: application.id,
+        metadata: { reviewerId: reviewer.id, previousReviewerId, status: application.status },
+      });
+      return application;
+    });
+    return ApplicationResponseDto.from(application);
+  }
+
+  /**
+   * Only the assigned reviewer, only while UNDER_REVIEW (i.e. after the risk check finished).
+   * An unassigned reviewer never even loads the row (visibility scope → 404).
+   */
+  async decide(user: AuthenticatedUser, id: string, dto: CreateDecisionDto): Promise<DecisionResultDto> {
+    return this.dataSource.transaction(async (manager) => {
+      const application = await this.applications.loadVisible(user, id, { manager, lock: true });
+      this.policy.assertCanDecide(user, application);
+
+      const rule = DECISION_RULES[dto.decision];
+      const fromStatus = application.status;
+      application.status = transition(application.status, rule.action);
+      await manager.save(application);
+
+      const decisions = manager.getRepository(ReviewDecision);
+      const decision = await decisions.save(
+        decisions.create({
+          applicationId: application.id,
+          reviewerId: user.id,
+          decision: dto.decision,
+          comment: dto.comment ?? null,
+        }),
+      );
+
+      await this.audit.record(manager, {
+        actorId: user.id,
+        action: rule.audit,
+        entityType: AuditEntityType.MERCHANT_APPLICATION,
+        entityId: application.id,
+        // The free-text comment stays in review_decisions; the audit references it by id.
+        metadata: { decisionId: decision.id, fromStatus, toStatus: application.status, riskStatus: application.riskStatus },
+      });
+
+      return { ...DecisionResponseDto.from(decision), applicationStatus: application.status };
+    });
+  }
+
+  async listDecisions(user: AuthenticatedUser, id: string): Promise<DecisionResponseDto[]> {
+    await this.applications.loadVisible(user, id);
+    const rows = await this.dataSource.getRepository(ReviewDecision).find({
+      where: { applicationId: id },
+      order: { createdAt: 'ASC', id: 'ASC' },
+    });
+    return rows.map((row) => DecisionResponseDto.from(row));
+  }
 
   /**
    * DRAFT/NEEDS_INFORMATION → SUBMITTED and start an asynchronous risk check.

@@ -1,7 +1,7 @@
 import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { DataSource } from 'typeorm';
-import { ApplicationStatus } from '../src/applications/application.enums';
+import { ApplicationRiskStatus, ApplicationStatus } from '../src/applications/application.enums';
 import { MerchantApplication } from '../src/applications/entities/merchant-application.entity';
 import {
   bearer,
@@ -161,6 +161,77 @@ describe('Authorization (e2e)', () => {
         .set(bearer(actors.admin.token))
         .send({ businessName: 'Corrected by admin' })
         .expect(200);
+    });
+  });
+
+  describe('review decisions (only the assigned REVIEWER)', () => {
+    beforeEach(async () => {
+      await forceApplicationState(dataSource, appOfSalesA.id, {
+        status: ApplicationStatus.UNDER_REVIEW,
+        riskStatus: ApplicationRiskStatus.CLEAR,
+        assignedReviewerId: actors.reviewerA.user.id,
+      });
+    });
+
+    const decide = (token: string, decision = 'APPROVE') =>
+      http().post(`/applications/${appOfSalesA.id}/decisions`).set(bearer(token)).send({ decision, comment: 'Reason' });
+    const storedStatus = async () =>
+      (await dataSource.getRepository(MerchantApplication).findOneByOrFail({ id: appOfSalesA.id })).status;
+
+    it.each(['APPROVE', 'REJECT', 'REQUEST_INFO'])('SALES (even the owner) cannot %s', async (decision) => {
+      await decide(actors.salesA.token, decision).expect(403);
+      expect(await storedStatus()).toBe(ApplicationStatus.UNDER_REVIEW);
+    });
+
+    it('ADMIN cannot record a decision', async () => {
+      await decide(actors.admin.token).expect(403);
+      expect(await storedStatus()).toBe(ApplicationStatus.UNDER_REVIEW);
+    });
+
+    it('an unassigned REVIEWER cannot record a decision', async () => {
+      await decide(actors.reviewerB.token).expect(404);
+      expect(await storedStatus()).toBe(ApplicationStatus.UNDER_REVIEW);
+    });
+
+    it('the assigned REVIEWER can record a decision', async () => {
+      const res = await decide(actors.reviewerA.token).expect(201);
+      expect(res.body).toMatchObject({ reviewerId: actors.reviewerA.user.id, applicationStatus: ApplicationStatus.APPROVED });
+    });
+
+    it('a REVIEWER loses access as soon as the application is reassigned', async () => {
+      await http()
+        .post(`/applications/${appOfSalesA.id}/assign-reviewer`)
+        .set(bearer(actors.admin.token))
+        .send({ reviewerId: actors.reviewerB.user.id })
+        .expect(200);
+
+      await decide(actors.reviewerA.token).expect(404);
+      await http().get(`/applications/${appOfSalesA.id}`).set(bearer(actors.reviewerA.token)).expect(404);
+      await decide(actors.reviewerB.token).expect(201);
+    });
+  });
+
+  describe('reviewer assignment (ADMIN only)', () => {
+    beforeEach(async () => {
+      await forceApplicationState(dataSource, appOfSalesA.id, { status: ApplicationStatus.SUBMITTED });
+    });
+
+    it.each(['salesA', 'reviewerA'] as const)('%s cannot assign a reviewer', async (who) => {
+      await http()
+        .post(`/applications/${appOfSalesA.id}/assign-reviewer`)
+        .set(bearer(actors[who].token))
+        .send({ reviewerId: actors.reviewerA.user.id })
+        .expect(403);
+    });
+
+    it('a REVIEWER cannot assign an application to themselves', async () => {
+      await http()
+        .post(`/applications/${appOfSalesA.id}/assign-reviewer`)
+        .set(bearer(actors.reviewerB.token))
+        .send({ reviewerId: actors.reviewerB.user.id })
+        .expect(403);
+      const stored = await dataSource.getRepository(MerchantApplication).findOneByOrFail({ id: appOfSalesA.id });
+      expect(stored.assignedReviewerId).toBeNull();
     });
   });
 

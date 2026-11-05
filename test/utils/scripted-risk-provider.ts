@@ -1,3 +1,4 @@
+import { Queue } from 'bullmq';
 import {
   RiskCheckRequest,
   RiskCheckResult,
@@ -44,6 +45,14 @@ export class ScriptedRiskProvider implements RiskProvider {
     }
     return this.delegate.assess(request);
   }
+}
+
+/** Waits until no job is waiting, running or scheduled for retry. */
+export function waitForQueueIdle(queue: Queue): Promise<unknown> {
+  return waitFor(
+    () => queue.getJobCounts('active', 'waiting', 'delayed'),
+    (c) => c.active + c.waiting + c.delayed === 0,
+  );
 }
 
 /** Polls until `predicate` holds (async work has no completion callback in the HTTP API). */

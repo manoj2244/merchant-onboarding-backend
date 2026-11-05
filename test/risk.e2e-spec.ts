@@ -20,7 +20,7 @@ import {
   resetDatabase,
   StandardActors,
 } from './utils/fixtures';
-import { ScriptedRiskProvider, waitFor } from './utils/scripted-risk-provider';
+import { ScriptedRiskProvider, waitFor, waitForQueueIdle } from './utils/scripted-risk-provider';
 import { createTestApp } from './utils/test-app';
 
 /** Runs the real BullMQ worker against Redis, with a scriptable provider in place of the vendor. */
@@ -46,10 +46,7 @@ describe('Asynchronous risk review (e2e)', () => {
   // Let in-flight jobs finish before the next test wipes the queue and database underneath them.
   afterEach(async () => {
     provider.reset();
-    await waitFor(
-      () => queue.getJobCounts('active', 'waiting', 'delayed'),
-      (c) => c.active + c.waiting + c.delayed === 0,
-    );
+    await waitForQueueIdle(queue);
   });
 
   afterAll(async () => {
