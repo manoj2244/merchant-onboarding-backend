@@ -8,6 +8,8 @@ import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 import { EnvironmentVariables, NodeEnv, validateEnv } from './config/env.validation';
 import { buildDataSourceOptions } from './database/typeorm.config';
+import { ApplicationsModule } from './applications/applications.module';
+import { AuditModule } from './audit/audit.module';
 import { AuthModule } from './auth/auth.module';
 import { HealthModule } from './health/health.module';
 import { UsersModule } from './users/users.module';
@@ -65,6 +67,8 @@ type Config = ConfigService<EnvironmentVariables, true>;
     HealthModule,
     UsersModule,
     AuthModule,
+    AuditModule,
+    ApplicationsModule,
   ],
   providers: [
     {

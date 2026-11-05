@@ -1,6 +1,8 @@
 import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { DataSource } from 'typeorm';
+import { BusinessType } from '../../src/applications/application.enums';
+import { MerchantApplication } from '../../src/applications/entities/merchant-application.entity';
 import { User } from '../../src/users/entities/user.entity';
 import { hashPassword } from '../../src/users/password';
 import { Role } from '../../src/users/role.enum';
@@ -68,3 +70,47 @@ export async function createStandardActors(app: INestApplication, dataSource: Da
 }
 
 export const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
+
+/** Obviously fictitious merchant data (example.com, TEST- tax ids, 555 numbers). */
+export function applicationPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    businessName: 'Example Coffee Roasters',
+    legalBusinessName: 'Example Coffee Roasters Pvt. Ltd.',
+    businessType: BusinessType.LLC,
+    website: 'https://coffee.example.com',
+    ownerFullName: 'Jane Example',
+    ownerEmail: 'jane.owner@example.com',
+    ownerPhone: '+15550101234',
+    ownerTaxId: 'TEST-000-1234',
+    requestedMonthlyVolume: 50000,
+    averageTicketSize: 25.5,
+    mcc: '5814',
+    currency: 'USD',
+    ...overrides,
+  };
+}
+
+export async function createApplication(
+  app: INestApplication,
+  token: string,
+  overrides: Record<string, unknown> = {},
+): Promise<{ id: string } & Record<string, unknown>> {
+  const res = await request(app.getHttpServer())
+    .post('/applications')
+    .set(bearer(token))
+    .send(applicationPayload(overrides))
+    .expect(201);
+  return res.body;
+}
+
+/**
+ * Arrange helper: puts an application directly into a given state, so a test can focus on one
+ * transition without replaying the whole workflow. Lifecycle tests use the real endpoints instead.
+ */
+export async function forceApplicationState(
+  dataSource: DataSource,
+  id: string,
+  patch: Partial<Pick<MerchantApplication, 'status' | 'riskStatus' | 'assignedReviewerId' | 'submissionCount'>>,
+): Promise<void> {
+  await dataSource.getRepository(MerchantApplication).update(id, patch);
+}

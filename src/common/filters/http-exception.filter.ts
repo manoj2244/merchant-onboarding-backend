@@ -1,5 +1,6 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import { Request, Response } from 'express';
+import { InvalidStateTransitionError } from '../../applications/domain/application-state-machine';
 
 export interface ErrorResponseBody {
   statusCode: number;
@@ -32,6 +33,11 @@ export class AllExceptionsFilter implements ExceptionFilter {
       const details = typeof body === 'object' && body !== null ? (body as { message?: string | string[]; error?: string }) : {};
       message = details.message ?? exception.message;
       error = details.error ?? exception.name;
+    } else if (exception instanceof InvalidStateTransitionError) {
+      // Domain rule violation: the request is valid but conflicts with the application's current state.
+      status = HttpStatus.CONFLICT;
+      error = 'Conflict';
+      message = exception.message;
     } else {
       const err = exception instanceof Error ? exception : new Error(String(exception));
       this.logger.error({ err: { name: err.name, message: err.message, stack: err.stack } }, 'Unhandled exception');
