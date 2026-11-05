@@ -1,5 +1,6 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
 import {
+  ApiAcceptedResponse,
   ApiBearerAuth,
   ApiConflictResponse,
   ApiCreatedResponse,
@@ -13,7 +14,9 @@ import { AuthenticatedUser } from '../auth/authenticated-user';
 import { AuditLogResponseDto } from '../audit/dto/audit-log-response.dto';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
+import { RiskAssessmentResponseDto } from '../risk/dto/risk-assessment-response.dto';
 import { Role } from '../users/role.enum';
+import { ApplicationWorkflowService } from './application-workflow.service';
 import { ApplicationsService } from './applications.service';
 import { ApplicationResponseDto, PaginatedApplicationsDto } from './dto/application-response.dto';
 import { CreateApplicationDto } from './dto/create-application.dto';
@@ -29,7 +32,10 @@ import { UpdateApplicationDto } from './dto/update-application.dto';
 @ApiNotFoundResponse({ description: 'Application does not exist or is not visible to the caller' })
 @Controller('applications')
 export class ApplicationsController {
-  constructor(private readonly applications: ApplicationsService) {}
+  constructor(
+    private readonly applications: ApplicationsService,
+    private readonly workflow: ApplicationWorkflowService,
+  ) {}
 
   @Post()
   @Roles(Role.SALES, Role.ADMIN)
@@ -68,6 +74,42 @@ export class ApplicationsController {
     @Body() dto: UpdateApplicationDto,
   ): Promise<ApplicationResponseDto> {
     return this.applications.update(user, id, dto);
+  }
+
+  @Post(':id/submit')
+  @Roles(Role.SALES, Role.ADMIN)
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({
+    summary: 'Submit for review; starts an asynchronous risk/KYB check',
+    description: 'Returns 202 immediately with status SUBMITTED / riskStatus PENDING. Poll the application or its risk assessments.',
+  })
+  @ApiAcceptedResponse({ type: ApplicationResponseDto })
+  @ApiConflictResponse({ description: 'Application is not in DRAFT or NEEDS_INFORMATION' })
+  submit(@CurrentUser() user: AuthenticatedUser, @Param('id', ParseUUIDPipe) id: string): Promise<ApplicationResponseDto> {
+    return this.workflow.submit(user, id);
+  }
+
+  @Get(':id/risk-assessments')
+  @ApiOperation({ summary: 'Risk assessment history (one per submission, newest first)' })
+  @ApiOkResponse({ type: [RiskAssessmentResponseDto] })
+  riskAssessments(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<RiskAssessmentResponseDto[]> {
+    return this.workflow.listRiskAssessments(user, id);
+  }
+
+  @Post(':id/risk-assessments/retry')
+  @Roles(Role.ADMIN)
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({ summary: 'Re-run a FAILED (or stuck PENDING) risk check for the current submission' })
+  @ApiAcceptedResponse({ type: RiskAssessmentResponseDto })
+  @ApiConflictResponse({ description: 'Nothing to retry' })
+  retryRiskAssessment(
+    @CurrentUser() user: AuthenticatedUser,
+    @Param('id', ParseUUIDPipe) id: string,
+  ): Promise<RiskAssessmentResponseDto> {
+    return this.workflow.retryRiskAssessment(user, id);
   }
 
   @Get(':id/audit-logs')
