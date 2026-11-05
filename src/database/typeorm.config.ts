@@ -19,6 +19,8 @@ export function buildDataSourceOptions(env: DatabaseEnv): DataSourceOptions {
     username: env.DATABASE_USER,
     password: env.DATABASE_PASSWORD,
     database: env.DATABASE_NAME,
+    // gen_random_uuid() is built into PostgreSQL 13+, so no uuid-ossp extension is needed.
+    uuidExtension: 'pgcrypto',
     entities: [join(__dirname, '..', '**', '*.entity.{ts,js}')],
     migrations: [join(__dirname, 'migrations', '*.{ts,js}')],
     synchronize: false,
