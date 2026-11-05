@@ -8,7 +8,9 @@ import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 import { EnvironmentVariables, NodeEnv, validateEnv } from './config/env.validation';
 import { buildDataSourceOptions } from './database/typeorm.config';
+import { AuthModule } from './auth/auth.module';
 import { HealthModule } from './health/health.module';
+import { UsersModule } from './users/users.module';
 
 type Config = ConfigService<EnvironmentVariables, true>;
 
@@ -57,10 +59,12 @@ type Config = ConfigService<EnvironmentVariables, true>;
     BullModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: Config) => ({
-        connection: { host: config.get('REDIS_HOST'), port: config.get('REDIS_PORT') },
+        connection: { host: config.get('REDIS_HOST'), port: config.get('REDIS_PORT'), db: config.get('REDIS_DB') },
       }),
     }),
     HealthModule,
+    UsersModule,
+    AuthModule,
   ],
   providers: [
     {

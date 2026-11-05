@@ -38,6 +38,11 @@ export class EnvironmentVariables {
   @IsInt()
   REDIS_PORT: number;
 
+  @IsInt()
+  @Min(0)
+  @Max(15)
+  REDIS_DB: number = 0;
+
   // A short secret makes HS256 tokens brute-forceable, so refuse to boot with one.
   @IsString()
   @MinLength(32)
@@ -45,6 +50,10 @@ export class EnvironmentVariables {
 
   @IsString()
   JWT_EXPIRES_IN: string = '1h';
+
+  @IsInt()
+  @Min(1)
+  LOGIN_RATE_LIMIT_PER_MINUTE: number = 10;
 
   @IsInt()
   @Min(1)
